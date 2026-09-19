@@ -4,6 +4,8 @@ import com.changedetector.registry.entity.Endpoint;
 import com.changedetector.registry.entity.SchemaField;
 import com.changedetector.registry.entity.Service;
 import com.changedetector.registry.ingestion.OpenApiIngestionService;
+import com.changedetector.registry.entity.ConsumerUsage;
+import com.changedetector.registry.repository.ConsumerUsageRepository;
 import com.changedetector.registry.repository.EndpointRepository;
 import com.changedetector.registry.repository.SchemaFieldRepository;
 import com.changedetector.registry.repository.ServiceRepository;
@@ -30,6 +32,9 @@ public class ContractRegistryIntegrationTest {
 
     @Autowired
     private SchemaFieldRepository schemaFieldRepository;
+
+    @Autowired
+    private ConsumerUsageRepository consumerUsageRepository;
 
     @Autowired
     private OpenApiIngestionService ingestionService;
@@ -93,5 +98,34 @@ public class ContractRegistryIntegrationTest {
         assertEquals(4, fields.size());
         assertTrue(fields.stream().anyMatch(f -> f.getFieldPath().equals("firstName") && f.getFieldType().equals("string")));
         assertTrue(fields.stream().anyMatch(f -> f.getFieldPath().equals("id") && f.getFieldType().equals("integer")));
+    }
+
+    @Test
+    public void testConsumerUsageRegistrationAndLookup() {
+        ConsumerUsage usage = ConsumerUsage.builder()
+                .consumerService("api-gateway")
+                .providerService("customers-service")
+                .endpointPath("/owners/{ownerId}")
+                .httpMethod("GET")
+                .fieldPath("firstName")
+                .evidenceType("CONFIRMED")
+                .sourceFile("src/main/java/com/example/OwnerGatewayClient.java")
+                .sourceLine(42)
+                .evidenceDetail("Field accessed via owner.getFirstName()")
+                .scanId("scan-001")
+                .build();
+
+        consumerUsageRepository.save(usage);
+
+        List<ConsumerUsage> byProvider = consumerUsageRepository.findByProviderService("customers-service");
+        assertEquals(1, byProvider.size());
+        assertEquals("api-gateway", byProvider.get(0).getConsumerService());
+        assertEquals("firstName", byProvider.get(0).getFieldPath());
+
+        List<ConsumerUsage> byEndpoint = consumerUsageRepository.findByProviderServiceAndEndpointPath("customers-service", "/owners/{ownerId}");
+        assertEquals(1, byEndpoint.size());
+
+        List<String> consumers = consumerUsageRepository.findDistinctConsumerServicesForProvider("customers-service");
+        assertTrue(consumers.contains("api-gateway"));
     }
 }
