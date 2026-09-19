@@ -9,6 +9,9 @@ import com.changedetector.registry.repository.EndpointRepository;
 import com.changedetector.registry.repository.SchemaFieldRepository;
 import com.changedetector.registry.repository.ServiceRepository;
 import com.changedetector.registry.repository.SpecVersionRepository;
+import com.changedetector.registry.diff.SchemaDiffEngine;
+import com.changedetector.registry.entity.SchemaChange;
+import com.changedetector.registry.repository.SchemaChangeRepository;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.http.HttpStatus;
@@ -28,17 +31,23 @@ public class ServiceController {
     private final EndpointRepository endpointRepository;
     private final SchemaFieldRepository schemaFieldRepository;
     private final OpenApiIngestionService ingestionService;
+    private final SchemaDiffEngine diffEngine;
+    private final SchemaChangeRepository schemaChangeRepository;
 
     public ServiceController(ServiceRepository serviceRepository,
                              SpecVersionRepository specVersionRepository,
                              EndpointRepository endpointRepository,
                              SchemaFieldRepository schemaFieldRepository,
-                             OpenApiIngestionService ingestionService) {
+                             OpenApiIngestionService ingestionService,
+                             SchemaDiffEngine diffEngine,
+                             SchemaChangeRepository schemaChangeRepository) {
         this.serviceRepository = serviceRepository;
         this.specVersionRepository = specVersionRepository;
         this.endpointRepository = endpointRepository;
         this.schemaFieldRepository = schemaFieldRepository;
         this.ingestionService = ingestionService;
+        this.diffEngine = diffEngine;
+        this.schemaChangeRepository = schemaChangeRepository;
     }
 
     public record CreateServiceRequest(@NotBlank String name, String baseUrl) {}
@@ -113,5 +122,43 @@ public class ServiceController {
             vId = latest.get().getId();
         }
         return ResponseEntity.ok(schemaFieldRepository.findBySpecVersionId(vId));
+    }
+
+    @GetMapping("/{id}/diff")
+    public ResponseEntity<?> getDiff(
+            @PathVariable Long id,
+            @RequestParam(required = false) Long oldVersionId,
+            @RequestParam(required = false) Long newVersionId) {
+        var serviceOpt = serviceRepository.findById(id);
+        if (serviceOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        var service = serviceOpt.get();
+
+        Long oldId = oldVersionId;
+        Long newId = newVersionId;
+
+        if (oldId == null || newId == null) {
+            List<SpecVersion> versions = specVersionRepository.findByServiceIdOrderByIngestedAtDesc(id);
+            if (versions.size() < 2) {
+                return ResponseEntity.badRequest().body(Map.of("error", "Service must have at least 2 versions to calculate diff"));
+            }
+            newId = versions.get(0).getId();
+            oldId = versions.get(1).getId();
+        }
+
+        var oldVersionOpt = specVersionRepository.findById(oldId);
+        var newVersionOpt = specVersionRepository.findById(newId);
+        if (oldVersionOpt.isEmpty() || newVersionOpt.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid version IDs provided"));
+        }
+
+        List<SchemaChange> cachedChanges = schemaChangeRepository.findByOldSpecVersionIdAndNewSpecVersionId(oldId, newId);
+        if (!cachedChanges.isEmpty()) {
+            return ResponseEntity.ok(cachedChanges);
+        }
+
+        List<SchemaChange> computed = diffEngine.computeAndSaveDiff(service, oldVersionOpt.get(), newVersionOpt.get());
+        return ResponseEntity.ok(computed);
     }
 }
