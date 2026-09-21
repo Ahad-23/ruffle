@@ -27,6 +27,7 @@
     <modules>
         <module>contract-registry</module>
         <module>consumer-analyzer</module>
+        <module>blast-cli</module>
     </modules>
 
     <dependencyManagement>

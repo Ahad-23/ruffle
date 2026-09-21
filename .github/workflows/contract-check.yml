@@ -1,0 +1,141 @@
+name: "🔍 Cross-Service Contract Breaking Change Detector"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**/*-service/**'
+      - '**/*gateway*/**'
+      - '**/openapi/**'
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  detect-and-check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: contract_registry
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d contract_registry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build Change Management Modules
+        run: mvn clean package -DskipTests
+
+      - name: Start Contract Registry
+        run: |
+          java -jar contract-registry/target/contract-registry-*.jar \
+            --spring.datasource.url=jdbc:postgresql://localhost:5432/contract_registry \
+            --spring.datasource.username=postgres \
+            --spring.datasource.password=postgres &
+          
+          echo "Waiting for Contract Registry to become healthy..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/v3/api-docs > /dev/null; then
+              echo "Contract Registry is UP!"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Scan Consumers with Static Analyzer
+        run: |
+          # Find all consumer modules or run on api-gateway
+          if [ -d "spring-petclinic-api-gateway" ]; then
+            java -jar consumer-analyzer/target/consumer-analyzer-*.jar \
+              --project-dir ./spring-petclinic-api-gateway \
+              --consumer-name api-gateway \
+              --registry-url http://localhost:8080
+          fi
+
+      - name: Ingest New Spec and Run Blast Radius
+        id: blast
+        run: |
+          REPORT_FILE="blast-report.md"
+          
+          # Check for changed openapi specs or run blast-cli
+          if [ -f "target/openapi.json" ]; then
+            curl -s -X POST "http://localhost:8080/api/services/1/ingest/upload" \
+              -H "Content-Type: application/json" \
+              -d @target/openapi.json
+          fi
+
+          java -jar blast-cli/target/blast-cli-*.jar \
+            --registry-url http://localhost:8080 \
+            --service-id 1 \
+            --output-file "$REPORT_FILE" || true
+
+          if grep -q "🔴 \*\*CONFIRMED\*\*" "$REPORT_FILE"; then
+            echo "has_confirmed=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_confirmed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post or Update PR Comment
+        uses: actions/github-script@v7
+        if: always() && steps.blast.outcome == 'success'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('blast-report.md')) {
+              console.log("No report generated.");
+              return;
+            }
+            const report = fs.readFileSync('blast-report.md', 'utf8');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.body.includes('Cross-Service Breaking Change Detection Report')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: report,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: report,
+              });
+            }
+
+      - name: Fail Check on Confirmed Breaking Changes
+        if: steps.blast.outputs.has_confirmed == 'true'
+        run: |
+          echo "::error::Breaking changes detected on downstream internal consumers! Check PR comment for details."
+          exit 1

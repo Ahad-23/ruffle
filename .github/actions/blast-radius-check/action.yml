@@ -1,0 +1,40 @@
+name: 'Blast Radius Check'
+description: 'Runs static consumer analysis, ingests OpenAPI specs, and generates PR blast radius report'
+inputs:
+  registry-url:
+    description: 'Contract Registry Service URL'
+    required: false
+    default: 'http://localhost:8080'
+  service-id:
+    description: 'Target Service ID'
+    required: true
+  consumer-project-dir:
+    description: 'Directory of consumer service'
+    required: false
+    default: '.'
+  consumer-name:
+    description: 'Name of consumer service'
+    required: false
+    default: 'consumer-service'
+outputs:
+  report-file:
+    description: 'Path to markdown report'
+    value: 'blast-report.md'
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Consumer Analyzer
+      shell: bash
+      run: |
+        java -jar consumer-analyzer/target/consumer-analyzer-*.jar \
+          --project-dir "${{ inputs.consumer-project-dir }}" \
+          --consumer-name "${{ inputs.consumer-name }}" \
+          --registry-url "${{ inputs.registry-url }}" || true
+
+    - name: Generate Blast Radius Report
+      shell: bash
+      run: |
+        java -jar blast-cli/target/blast-cli-*.jar \
+          --registry-url "${{ inputs.registry-url }}" \
+          --service-id "${{ inputs.service-id }}" \
+          --output-file "blast-report.md"
