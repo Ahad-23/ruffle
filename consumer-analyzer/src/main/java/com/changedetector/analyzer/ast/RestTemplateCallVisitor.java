@@ -54,6 +54,8 @@ public class RestTemplateCallVisitor extends VoidVisitorAdapter<String> {
         Expression firstArg = call.getArgument(0);
         if (firstArg instanceof StringLiteralExpr str) {
             uriString = str.getValue();
+        } else if (firstArg.isBinaryExpr() && firstArg.asBinaryExpr().getLeft() instanceof StringLiteralExpr leftStr) {
+            uriString = leftStr.getValue();
         } else {
             uriString = firstArg.toString().replace("\"", "");
         }
