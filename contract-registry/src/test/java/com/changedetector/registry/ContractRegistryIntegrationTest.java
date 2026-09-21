@@ -13,6 +13,9 @@ import com.changedetector.registry.repository.SpecVersionRepository;
 import com.changedetector.registry.diff.SchemaDiffEngine;
 import com.changedetector.registry.entity.SchemaChange;
 import com.changedetector.registry.repository.SchemaChangeRepository;
+import com.changedetector.registry.blast.BlastRadiusService;
+import com.changedetector.registry.entity.BlastReport;
+import com.changedetector.registry.repository.BlastReportRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -43,7 +46,13 @@ public class ContractRegistryIntegrationTest {
     private SchemaChangeRepository schemaChangeRepository;
 
     @Autowired
+    private BlastReportRepository blastReportRepository;
+
+    @Autowired
     private SchemaDiffEngine diffEngine;
+
+    @Autowired
+    private BlastRadiusService blastRadiusService;
 
     @Autowired
     private OpenApiIngestionService ingestionService;
@@ -311,5 +320,81 @@ public class ContractRegistryIntegrationTest {
                 "firstName".equals(c.getNewValue()) &&
                 "BREAKING".equals(c.getSeverity()));
         assertTrue(foundFieldRenamed, "Should detect BREAKING FIELD_RENAMED for first_name -> firstName");
+    }
+
+    @Test
+    public void testBlastRadiusCalculationAndReportGeneration() {
+        // Register provider service with V1 and V2
+        Service service = serviceRepository.save(new Service("blast-provider-service", "http://blast-provider:8080"));
+        OpenApiIngestionService.IngestionResult v1Result = ingestionService.ingestSpecContent(service.getId(), SPEC_V1, "v1.0.0");
+        OpenApiIngestionService.IngestionResult v2Result = ingestionService.ingestSpecContent(service.getId(), SPEC_V2, "v2.0.0");
+
+        // 1. Confirmed usage on firstName (removed in V2)
+        ConsumerUsage confirmedUsage = ConsumerUsage.builder()
+                .consumerService("order-service")
+                .providerService("blast-provider-service")
+                .endpointPath("/owners/{ownerId}")
+                .httpMethod("GET")
+                .fieldPath("firstName")
+                .evidenceType("CONFIRMED")
+                .sourceFile("OrderService.java")
+                .sourceLine(25)
+                .evidenceDetail("owner.getFirstName()")
+                .build();
+        consumerUsageRepository.save(confirmedUsage);
+
+        // 2. Likely usage on city (type changed from string to integer in V2)
+        ConsumerUsage likelyUsage = ConsumerUsage.builder()
+                .consumerService("billing-service")
+                .providerService("blast-provider-service")
+                .endpointPath("/owners/{ownerId}")
+                .httpMethod("GET")
+                .fieldPath("city")
+                .evidenceType("LIKELY")
+                .sourceFile("BillingClient.java")
+                .sourceLine(80)
+                .evidenceDetail("map.get(\"city\")")
+                .build();
+        consumerUsageRepository.save(likelyUsage);
+
+        // 3. Calculate Blast Radius
+        BlastRadiusService.BlastRadiusReport report = blastRadiusService.calculateBlastRadius(
+                service.getId(),
+                v1Result.getSpecVersion().getId(),
+                v2Result.getSpecVersion().getId()
+        );
+
+        assertNotNull(report);
+        assertEquals("blast-provider-service", report.getProviderService());
+        assertEquals(1, report.getConfirmedCount(), "Should have 1 confirmed breaking impact");
+        assertEquals(1, report.getLikelyCount(), "Should have 1 likely breaking impact");
+
+        // Verify confirmed impact item
+        BlastRadiusService.ImpactItem confirmed = report.getConfirmedImpacts().get(0);
+        assertEquals("order-service", confirmed.getConsumerService());
+        assertEquals("firstName", confirmed.getFieldPath());
+        assertEquals("FIELD_REMOVED", confirmed.getChangeType());
+        assertEquals("BREAKING", confirmed.getSeverity());
+
+        // Verify likely impact item
+        BlastRadiusService.ImpactItem likely = report.getLikelyImpacts().get(0);
+        assertEquals("billing-service", likely.getConsumerService());
+        assertEquals("city", likely.getFieldPath());
+        assertEquals("TYPE_CHANGED", likely.getChangeType());
+        assertEquals("BREAKING", likely.getSeverity());
+
+        // Verify safe changes contains preferredContact
+        assertTrue(report.getSafeChanges().stream().anyMatch(s -> "preferredContact".equals(s.getFieldPath())));
+
+        // Verify persisted report in database
+        List<BlastReport> reports = blastReportRepository.findByServiceIdOrderByGeneratedAtDesc(service.getId());
+        assertFalse(reports.isEmpty());
+        assertEquals(1, reports.get(0).getConfirmedCount());
+
+        // Verify markdown report generation
+        String markdown = blastRadiusService.formatMarkdownReport(report);
+        assertTrue(markdown.contains("Cross-Service Breaking Change Detection Report"));
+        assertTrue(markdown.contains("order-service"));
+        assertTrue(markdown.contains("billing-service"));
     }
 }
